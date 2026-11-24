@@ -11,19 +11,26 @@
 set -euo pipefail
 cd "$(dirname "$0")/.."
 
-LAYOUT=${LAYOUT:-oci-layout}
+# An absolute LAYOUT is used as-is; a relative one is resolved against the
+# repository root this script just changed into.
+LAYOUT_RAW=${LAYOUT:-oci-layout}
+if [[ "${LAYOUT_RAW}" != /* ]]; then
+  LAYOUT="${PWD}/${LAYOUT_RAW}"
+else
+  LAYOUT="${LAYOUT_RAW}"
+fi
 SRC_TAG=${SRC_TAG:-demo:1.0.1}
 DST_TAG=${DST_TAG:-demo:1.0.1-squashed}
 PORT=${PORT:-8080}
 
-echo "==> 1/5  Build sample image ${SRC_TAG} (3 uncompressed layers) into ./${LAYOUT}"
+echo "==> 1/5  Build sample image ${SRC_TAG} (3 uncompressed layers) into ${LAYOUT}"
 python3 examples/make_sample_image.py --force --tag "${SRC_TAG}" "${LAYOUT}"
 
 if [[ "${DIRECT:-0}" == "1" ]]; then
   echo "==> 2/5  Start API directly: uvicorn on :${PORT} (DIRECT=1)"
   # log to a file so the background process does not hold this script's
-  # stdout open
-  OCI_LAYOUT_DIR="${PWD}/${LAYOUT}" python3 -m uvicorn app.main:app \
+  # stdout open; LAYOUT is already an absolute path at this point
+  OCI_LAYOUT_DIR="${LAYOUT}" python3 -m uvicorn app.main:app \
     --host 127.0.0.1 --port "${PORT}" > uvicorn-demo.log 2>&1 &
   API_PID=$!
   trap 'kill ${API_PID} 2>/dev/null || true' EXIT

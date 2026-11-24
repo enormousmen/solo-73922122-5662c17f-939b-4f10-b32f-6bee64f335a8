@@ -204,6 +204,198 @@ def test_file_replaces_dir_subtree(tmp_path):
     assert "d" in names and "d/x" not in names
 
 
+# ---------------------------------------------------------------------------
+# directory replacement: a rebuilt directory must keep hiding the children
+# that lower layers (including the base layer below the merged one) held at
+# the same path
+# ---------------------------------------------------------------------------
+
+
+def test_lower_whiteout_then_upper_rebuilds_dir_keeps_base_hidden(tmp_path):
+    """L1 deletes a base-populated directory; L2 rebuilds it explicitly.
+
+    The merged layer must still carry a whiteout so the base-layer children
+    cannot reappear under the rebuilt directory.
+    """
+    base = tmp_path / "base.tar"
+    build_layer_tar(base, [
+        dir_entry("app"), dir_entry("app/.config"),
+        file_entry("app/.config/base.ini", b"[base]\n"),
+        file_entry("app/.config/old.cfg", b"old\n"),
+    ])
+    l1 = tmp_path / "l1.tar"
+    build_layer_tar(l1, [whiteout_entry("app/.config")])
+    l2 = tmp_path / "l2.tar"
+    build_layer_tar(l2, [
+        dir_entry("app/.config", mode=0o700, uid=10, gid=20),
+        file_entry("app/.config/new.ini", b"[new]\n", mode=0o640, uid=10, gid=20),
+    ])
+
+    merged = check_equivalent(tmp_path, base, l1, l2)
+    names = layer_entry_names(merged)
+    assert "app/.wh..config" in names  # deletion still applies to the base
+    assert "app/.config" in names and "app/.config/new.ini" in names
+    assert "app/.config/base.ini" not in names
+    assert "app/.config/old.cfg" not in names
+
+    tree = expand_stack([base, merged])
+    assert sorted(p for p in tree.nodes if p) == [
+        "app", "app/.config", "app/.config/new.ini",
+    ]
+    # metadata of the rebuilt directory and new file is preserved
+    assert tree.nodes["app/.config"].mode == 0o700
+    assert (tree.nodes["app/.config"].uid, tree.nodes["app/.config"].gid) == (10, 20)
+    assert tree.nodes["app/.config/new.ini"].mode == 0o640
+
+
+def test_lower_file_replaced_by_upper_dir_synthesizes_hiding_whiteout(tmp_path):
+    """L1 turns base directory ``d`` into a regular file; L2 rebuilds ``d``
+    as a directory.  No whiteout existed in the inputs, so the merger must
+    synthesize one — otherwise base children leak through the new dir."""
+    base = tmp_path / "base.tar"
+    build_layer_tar(base, [
+        dir_entry("d"), file_entry("d/x", b"x"),
+        dir_entry("d/sub"), file_entry("d/sub/deep", b"deep"),
+    ])
+    l1 = tmp_path / "l1.tar"
+    build_layer_tar(l1, [file_entry("d", b"d is a file now")])
+    l2 = tmp_path / "l2.tar"
+    build_layer_tar(l2, [dir_entry("d"), file_entry("d/new", b"n")])
+
+    merged = check_equivalent(tmp_path, base, l1, l2)
+    names = layer_entry_names(merged)
+    assert names == [".wh.d", "d", "d/new"]
+
+    tree = expand_stack([base, merged])
+    assert sorted(p for p in tree.nodes if p) == ["d", "d/new"]
+    assert tree.nodes["d"].kind == "dir"
+
+
+def test_same_layer_whiteout_after_rebuilt_dir_entries(tmp_path):
+    """The upper layer deletes a lower directory and rebuilds it in the same
+    tar, with the whiteout marker sorted *after* the new entries.  The new
+    directory and its files must survive; the lower children stay hidden."""
+    base = tmp_path / "base.tar"
+    build_layer_tar(base, [
+        dir_entry("app"), dir_entry("app/.config"),
+        file_entry("app/.config/base.ini", b"[base]\n"),
+    ])
+    l1 = tmp_path / "l1.tar"
+    build_layer_tar(l1, [])  # empty lower layer
+    # tar order is deliberately: new dir entries first, whiteout last
+    l2 = tmp_path / "l2.tar"
+    build_layer_tar(l2, [
+        dir_entry("app"),
+        dir_entry("app/.config"),
+        file_entry("app/.config/new.ini", b"[new]\n"),
+        whiteout_entry("app/.config"),
+    ])
+
+    merged = check_equivalent(tmp_path, base, l1, l2)
+    # whiteout is emitted before the rebuilt subtree so strictly sequential
+    # tar appliers delete the lower directory before re-creating it
+    with tarfile.open(merged, "r:") as tf:
+        stream_order = [m.name for m in tf]
+    assert stream_order == [
+        "app", "app/.wh..config", "app/.config", "app/.config/new.ini",
+    ]
+    names = layer_entry_names(merged)
+    assert set(names) == set(stream_order)
+    # and the whiteout really deletes the lower subtree at apply time
+    tree = expand_stack([base, merged])
+    assert sorted(p for p in tree.nodes if p) == [
+        "app", "app/.config", "app/.config/new.ini",
+    ]
+    assert "app/.config/base.ini" not in tree.nodes
+
+def test_same_layer_whiteout_before_rebuilt_dir_entries(tmp_path):
+    """Same rebuild, but with the conventional marker-first tar ordering."""
+    base = tmp_path / "base.tar"
+    build_layer_tar(base, [dir_entry("d"), file_entry("d/base", b"b")])
+    l1 = tmp_path / "l1.tar"
+    build_layer_tar(l1, [])
+    l2 = tmp_path / "l2.tar"
+    build_layer_tar(l2, [
+        whiteout_entry("d"), dir_entry("d"), file_entry("d/only", b"o"),
+    ])
+
+    merged = check_equivalent(tmp_path, base, l1, l2)
+    assert layer_entry_names(merged) == [".wh.d", "d", "d/only"]
+    tree = expand_stack([base, merged])
+    assert sorted(p for p in tree.nodes if p) == ["d", "d/only"]
+
+
+def test_plain_dir_overlay_keeps_untouched_lower_children(tmp_path):
+    """A directory that merely overlays a lower directory stays a union."""
+    base = tmp_path / "base.tar"
+    build_layer_tar(base, [
+        dir_entry("d", mode=0o700, uid=3, gid=4),
+        file_entry("d/keep", b"k"), file_entry("d/gone", b"g"),
+    ])
+    l1 = tmp_path / "l1.tar"
+    build_layer_tar(l1, [file_entry("d/a", b"a"), whiteout_entry("d/gone")])
+    l2 = tmp_path / "l2.tar"
+    build_layer_tar(l2, [dir_entry("d", mode=0o755), file_entry("d/b", b"b")])
+
+    merged = check_equivalent(tmp_path, base, l1, l2)
+    names = layer_entry_names(merged)
+    assert "d/.wh.gone" in names and "d/a" in names and "d/b" in names
+    assert ".wh.d" not in names  # no directory replacement happened
+    tree = expand_stack([base, merged])
+    assert sorted(p for p in tree.nodes if p) == ["d", "d/a", "d/b", "d/keep"]
+    # explicit upper dir entry wins for the directory's own metadata
+    assert tree.nodes["d"].mode == 0o755
+    assert tree.nodes["d/keep"].content[1] == 1
+
+
+def test_dir_rebuilt_over_file_with_base_siblings_still_hidden(tmp_path):
+    """End-to-end style: base holds ``etc/`` plus a populated ``etc/cfg``;
+    L1 replaces ``etc/cfg`` by a file; L2 makes it a directory again with
+    new content.  Nothing from the old ``etc/cfg`` subtree may resurface."""
+    base = tmp_path / "base.tar"
+    build_layer_tar(base, [
+        dir_entry("etc"), dir_entry("etc/cfg"),
+        file_entry("etc/cfg/a", b"a"), file_entry("etc/cfg/b", b"b"),
+        file_entry("etc/host", b"host\n"),
+    ])
+    l1 = tmp_path / "l1.tar"
+    build_layer_tar(l1, [file_entry("etc/cfg", b"single file")])
+    l2 = tmp_path / "l2.tar"
+    build_layer_tar(l2, [
+        dir_entry("etc/cfg"), file_entry("etc/cfg/c", b"c"),
+    ])
+
+    merged = check_equivalent(tmp_path, base, l1, l2)
+    tree = expand_stack([base, merged])
+    assert sorted(p for p in tree.nodes if p) == [
+        "etc", "etc/cfg", "etc/cfg/c", "etc/host",
+    ]
+
+
+def test_rebuilt_dir_metadata_and_owner_matched_in_full_stack(tmp_path):
+    """Paths, contents, permissions and owners must match through the merge."""
+    base = tmp_path / "base.tar"
+    build_layer_tar(base, [dir_entry("d"), file_entry("d/old", b"old")])
+    l1 = tmp_path / "l1.tar"
+    build_layer_tar(l1, [whiteout_entry("d")])
+    l2 = tmp_path / "l2.tar"
+    build_layer_tar(l2, [
+        dir_entry("d", mode=0o711, uid=77, gid=88),
+        file_entry("d/new", b"new", mode=0o600, uid=77, gid=88),
+    ])
+
+    merged = check_equivalent(tmp_path, base, l1, l2)
+    tree_old = expand_stack([base, l1, l2])
+    tree_new = expand_stack([base, merged])
+    # compare observable attributes only (the bookkeeping "layer" field
+    # naturally differs between the original stack and the squashed one)
+    for path in ("d", "d/new"):
+        a, b = tree_new.nodes[path], tree_old.nodes[path]
+        assert (a.kind, a.mode, a.uid, a.gid, a.content) == (
+            b.kind, b.mode, b.uid, b.gid, b.content
+        )
+
+
 def test_duplicate_entries_within_one_layer_last_wins(tmp_path):
     base = tmp_path / "base.tar"
     build_layer_tar(base, [file_entry("f", b"base")])

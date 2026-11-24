@@ -10,7 +10,9 @@
 - 合并语义（与 overlay 应用语义一致）：
   - 删除（whiteout）与目录遮蔽（opaque whiteout）仍然作用于**更低层**——合并层里保留对应的 whiteout / opaque 标记；
   - 同一层在遮蔽目录后新增的文件照常保留；
-  - 上层条目覆盖下层同路径条目；下层被遮蔽/删除的条目不会泄漏进合并层。
+  - 上层条目覆盖下层同路径条目；下层被遮蔽/删除的条目不会泄漏进合并层；
+  - **目录重建不泄漏旧子项**：低层用普通 whiteout 删除目录、或把目录换成普通文件后，高层在原路径显式重建目录时，合并层会保留/合成对应 whiteout，基础层旧子项继续隐藏；同层"whiteout + 显式重建"即使 whiteout 条目在 tar 流中排在新条目之后，新目录和新文件也保留；普通目录叠加仍是并集，低层未被改动的子项继续可见；
+  - 合并层输出时 whiteout 始终排在其作用的目标子树之前，保证严格按 tar 顺序解包的应用器也能得到正确结果。
 - **基础层只取已有元数据**：新清单直接沿用基础层的 descriptor（摘要不变），从不读取基础层内容。
 - **资源占用**：文件正文全程流式处理（两遍扫描：第一遍只读 tar 头建元数据索引，第二遍从源 blob 顺序拷贝数据写入新层），内存占用不随文件正文大小增长；磁盘上除新层 blob 外只暂存元数据（内存中的条目索引），不产生其他中间文件。
 - **清单与配置一致**：新 manifest 的 layers = 基础层 descriptors + 合并层 descriptor；新 config 的 `rootfs.diff_ids` 与 history 同步收缩，`config` 段（Cmd/Entrypoint/Env/WorkingDir/User 等启动配置）原样保留。未压缩层的 diff_id 等于 blob 摘要。
@@ -87,13 +89,31 @@ python3 examples/verify_equal.py oci-layout demo:1.0.1 demo:1.0.1-squashed
 
 ## 演示场景说明
 
-示例镜像顶层（patch2）包含 `app/data/.wh..wh..opq`（遮蔽 base 与 patch1 写入
-`/app/data` 的全部内容）以及同层新增的 `app/data/fresh.txt`。合并后：
+示例镜像除了 opaque 遮蔽场景外，还用 `app/.config` 与 `app/replaced` 覆盖三类目录重建：
+
+- `app/data/.wh..wh..opq`（遮蔽 base 与 patch1 写入 `/app/data` 的全部内容）以及同层新增的
+  `app/data/fresh.txt`；
+- `app/.config`：patch1 用普通 whiteout 删掉整个基础层目录，patch2 在原路径显式重建
+  （`0750 1000:1000`）并新增 `runtime.ini`，且同层 whiteout 条目在 tar 流中排在新条目**之后**；
+- `app/replaced`：基础层是含 `leaf.txt` 的目录，patch1 把它换成普通文件，patch2 再重建为目录
+  并新增 `new.txt`——该路径输入中没有 whiteout，合并层会**合成**一个零字节 whiteout 来持续隐藏基础层旧子项。
+
+合并后：
 
 - 合并层仍含 `app/data/.wh..wh..opq` —— 遮蔽继续作用于基础层；
-- `app/data/fresh.txt` 照常保留；
-- patch1 的 `junk.txt`、`tmpdir/` 等被遮蔽内容不会进入合并层；
+- 合并层含 `app/.wh..config`（保留）与 `app/.wh.replaced`（合成），两个重建目录的基础层旧子项
+  （`base.ini`、`settings.ini`、`leaf.txt`）都不会复活；
+- `app/.config/runtime.ini`、`app/replaced/new.txt` 等新条目及其权限/属主原样保留；
+- 普通目录叠加（如 `etc/`）未被改动的低层子项 `etc/keep.cfg` 继续可见；
 - `etc/.wh.old.cfg` 的删除语义保留（即使 base 里也有该文件，展开结果仍一致）。
+
+合并层 tar 的条目顺序保证 whiteout 在其作用的目标子树之前，例如：
+
+```
+app/.wh..config                 # 先删除低层目录
+app/.config/                    # 再重建目录
+app/.config/runtime.ini
+```
 
 `examples/verify_equal.py` 会把新旧两个标签的所有层分别展开到内存虚拟文件系统，
 逐路径比对类型、内容摘要、权限位与 uid/gid。
@@ -104,8 +124,10 @@ python3 examples/verify_equal.py oci-layout demo:1.0.1 demo:1.0.1-squashed
 python3 -m pytest        # 需要 fastapi/uvicorn/pytest/httpx
 ```
 
-覆盖：opaque 遮蔽后新增、whiteout 各类组合、元数据/属主保留、32MiB 文件的内存上界
-（<16MiB）、API 全流程、失败时不发布新标签且原标签可用、临时文件清理等。
+覆盖：opaque 遮蔽后新增、whiteout 各类组合、目录重建三场景（低层 whiteout 后高层重建、
+低层文件换目录后高层重建、同层 whiteout 排在重建条目之后）、普通目录叠加保留低层子项、
+元数据/属主保留、32MiB 文件的内存上界（<16MiB）、API 全流程、失败时不发布新标签且原标签可用、
+临时文件清理等。
 
 ## 限制
 

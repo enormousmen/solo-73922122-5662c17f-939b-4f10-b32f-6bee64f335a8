@@ -1,17 +1,28 @@
 #!/usr/bin/env python3
 """Build a 3-layer demo image (uncompressed tar layers) in an OCI layout.
 
-The image is crafted so that the *top* layer contains an opaque whiteout on
-``/app/data`` (masking everything base and patch1 put there) followed by new
-files in that same directory — the scenario the merge demo showcases:
+The image exercises every directory-replacement case the merger must get
+right, plus the classic opaque-whiteout scenario:
 
-    base.tar    /app/data/old.log, /app/data/base.txt, /etc/keep.cfg, /etc/old.cfg
-    patch1.tar  + /app/data/junk.txt, /app/data/tmpdir/scratch.bin,
-                ~ /etc/old.cfg (modified), + /app/server.bin (v1)
-    patch2.tar  OPAQUE /app/data  (masks old.log, base.txt, junk.txt, tmpdir/)
-                + /app/data/fresh.txt          <- new file in the masked dir
-                - /etc/old.cfg (whiteout), + /etc/new.cfg
-                ~ /app/server.bin (v2)
+    base.tar
+      app/data/                 old.log, base.txt          (opaque-masked later)
+      app/.config/              base.ini, settings.ini     (dir rebuild cases)
+      app/replaced/             leaf.txt                   (file -> dir case)
+      etc/                      keep.cfg, old.cfg
+    patch1.tar
+      app/data/                 + junk.txt, tmpdir/        (masked by patch2)
+      app/server.bin            v1
+      etc/old.cfg               modified
+      app/.config/              WHITEOUT (whole dir deleted)
+      app/replaced              becomes a regular FILE
+    patch2.tar
+      app/data/                 OPAQUE marker + fresh.txt
+      app/.config/              rebuilt explicitly:
+                                new dir + runtime.ini, and a plain whiteout
+                                placed AFTER the new entries in this tar
+      app/replaced/             rebuilt as a directory again (+ new.txt)
+      etc/                      - old.cfg (whiteout), + new.cfg
+      app/server.bin            v2
 
 Usage: make_sample_image.py [--force] [--tag TAG] LAYOUT_DIR
 """
@@ -63,6 +74,13 @@ def build_layers(work: Path) -> list[Path]:
         _add_dir(tf, "app/data")
         _add_file(tf, "app/data/old.log", b"old log from base\n")
         _add_file(tf, "app/data/base.txt", b"base file\n")
+        # directory that patch1 deletes and patch2 rebuilds
+        _add_dir(tf, "app/.config", mode=0o755)
+        _add_file(tf, "app/.config/base.ini", b"[base]\nmode=old\n", mode=0o644)
+        _add_file(tf, "app/.config/settings.ini", b"debug=true\n", mode=0o640)
+        # directory that patch1 turns into a regular file
+        _add_dir(tf, "app/replaced")
+        _add_file(tf, "app/replaced/leaf.txt", b"leaf from base\n")
         _add_dir(tf, "etc")
         _add_file(tf, "etc/keep.cfg", b"keep=1\n")
         _add_file(tf, "etc/old.cfg", b"old=1\n")
@@ -74,6 +92,10 @@ def build_layers(work: Path) -> list[Path]:
         _add_file(tf, "app/data/tmpdir/scratch.bin", b"scratch\n")
         _add_file(tf, "app/server.bin", b"server-binary-v1\n", mode=0o755)
         _add_file(tf, "etc/old.cfg", b"old=2  # modified by patch1\n")
+        # delete the whole base configuration directory
+        _add_file(tf, "app/.wh..config", b"")
+        # replace a directory by a plain regular file
+        _add_file(tf, "app/replaced", b"this path is a file after patch1\n")
 
     patch2 = work / "patch2.tar"
     with tarfile.open(patch2, "w", format=tarfile.PAX_FORMAT) as tf:
@@ -81,6 +103,15 @@ def build_layers(work: Path) -> list[Path]:
         _add_file(tf, "app/data/.wh..wh..opq", b"")
         # ... then add fresh files to the same directory
         _add_file(tf, "app/data/fresh.txt", b"fresh file added after masking\n")
+        # rebuild app/.config explicitly; note the plain whiteout is emitted
+        # AFTER the new entries in this tar — same-layer re-creation must win
+        _add_dir(tf, "app/.config", mode=0o750, uid=1000, gid=1000)
+        _add_file(tf, "app/.config/runtime.ini",
+                  b"[runtime]\nworkers=4\n", mode=0o640, uid=1000, gid=1000)
+        _add_file(tf, "app/.wh..config", b"")
+        # rebuild app/replaced as a directory with fresh content
+        _add_dir(tf, "app/replaced", mode=0o755)
+        _add_file(tf, "app/replaced/new.txt", b"new dir content\n")
         _add_file(tf, "etc/.wh.old.cfg", b"")  # delete the modified config
         _add_file(tf, "etc/new.cfg", b"new=1\n")
         _add_file(tf, "app/server.bin", b"server-binary-v2\n", mode=0o755)

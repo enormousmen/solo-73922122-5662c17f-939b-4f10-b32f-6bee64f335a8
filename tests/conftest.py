@@ -156,10 +156,16 @@ class Node:
     uid: int
     gid: int
     content: tuple[str, int] | None  # (sha256, size) for files
+    layer: int = -1  # index of the layer that last set this node
 
 
 class VFS:
-    """Applies layer tars with OCI whiteout semantics, in memory."""
+    """Applies layer tars with OCI whiteout semantics, in memory.
+
+    Whiteouts and opaque markers hide entries contributed by *lower* layers
+    only: real entries added by the same layer survive no matter whether the
+    marker precedes or follows them inside that layer's tar stream.
+    """
 
     def __init__(self) -> None:
         self.nodes: dict[str, Node] = {"": Node("dir", 0o755, 0, 0, None)}
@@ -170,57 +176,67 @@ class VFS:
         parts = [c for c in name.split("/") if c not in ("", ".")]
         return "/".join(parts) if parts else None
 
-    def _ensure_parents(self, path: str) -> None:
+    def _ensure_parents(self, path: str, layer: int) -> None:
         comps = path.split("/") if path else []
         for i in range(1, len(comps) + 1):
             p = "/".join(comps[:i])
             if p not in self.nodes:
-                self.nodes[p] = Node("dir", 0o755, 0, 0, None)
+                self.nodes[p] = Node("dir", 0o755, 0, 0, None, layer=layer)
 
-    def _remove(self, path: str) -> None:
-        self.nodes.pop(path, None)
+    def _remove(self, path: str, layer: int | None = None) -> None:
+        """Remove ``path`` and its subtree.
+
+        With ``layer`` given, only nodes created by lower layers
+        (``node.layer < layer``) are removed — the semantics of a whiteout
+        applied while folding in that layer.
+        """
         prefix = path + "/"
-        for key in [k for k in self.nodes if k.startswith(prefix)]:
-            del self.nodes[key]
+        for key in [k for k in self.nodes if k == path or k.startswith(prefix)]:
+            if layer is None or self.nodes[key].layer < layer:
+                del self.nodes[key]
 
-    def _children_of(self, directory: str) -> list[str]:
+    def _children_of(self, directory: str, layer: int) -> list[str]:
         prefix = directory + "/" if directory else ""
         return [
             k
             for k in self.nodes
-            if k != directory and (k.startswith(prefix) if prefix else k != "")
+            if k != directory
+            and (k.startswith(prefix) if prefix else k != "")
+            and self.nodes[k].layer < layer
         ]
 
     # -- application ------------------------------------------------------
-    def apply_layer(self, tar_path: Path) -> None:
+    def apply_layer(self, tar_path: Path, layer: int = -1) -> None:
         with tarfile.open(tar_path, "r:") as tf:
             for ti in tf:
-                self._apply_entry(tf, ti)
+                self._apply_entry(tf, ti, layer)
 
-    def _apply_entry(self, tf: tarfile.TarFile, ti: tarfile.TarInfo) -> None:
+    def _apply_entry(self, tf: tarfile.TarFile, ti: tarfile.TarInfo, layer: int) -> None:
         name = self._norm(ti.name)
         if name is None:
             return
         parent, _, base = name.rpartition("/")
         if base == ".wh..wh..opq":
-            self._ensure_parents(parent)
-            for child in self._children_of(parent):
+            self._ensure_parents(parent, layer)
+            for child in self._children_of(parent, layer):
                 del self.nodes[child]
             return
         if base.startswith(".wh."):
             target = f"{parent}/{base[4:]}" if parent else base[4:]
-            self._remove(target)
+            self._remove(target, layer=layer)
             return
-        self._ensure_parents(parent)
+        self._ensure_parents(parent, layer)
         if ti.isdir():
-            self.nodes[name] = Node("dir", ti.mode & 0o7777, ti.uid, ti.gid, None)
+            self.nodes[name] = Node(
+                "dir", ti.mode & 0o7777, ti.uid, ti.gid, None, layer=layer
+            )
         elif ti.isreg():
             f = tf.extractfile(ti)
             data = f.read() if f else b""
             self._remove(name)  # a file replaces whatever was here
             self.nodes[name] = Node(
                 "file", ti.mode & 0o7777, ti.uid, ti.gid,
-                (hashlib.sha256(data).hexdigest(), len(data)),
+                (hashlib.sha256(data).hexdigest(), len(data)), layer=layer,
             )
         else:  # pragma: no cover
             raise AssertionError(f"unexpected entry type in test layer: {ti.name}")
@@ -235,13 +251,15 @@ class VFS:
         )
         for path in sorted(mine):
             a, b = mine[path], theirs[path]
-            assert a == b, f"node differs at {path!r}:\n  first:  {a}\n  second: {b}"
+            assert (a.kind, a.mode, a.uid, a.gid, a.content) == (
+                b.kind, b.mode, b.uid, b.gid, b.content
+            ), f"node differs at {path!r}:\n  first:  {a}\n  second: {b}"
 
 
 def expand_stack(layer_tars: list[Path]) -> VFS:
     vfs = VFS()
-    for tar_path in layer_tars:
-        vfs.apply_layer(tar_path)
+    for idx, tar_path in enumerate(layer_tars):
+        vfs.apply_layer(tar_path, layer=idx)
     return vfs
 
 

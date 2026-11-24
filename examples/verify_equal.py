@@ -28,9 +28,17 @@ class Node:
     uid: int
     gid: int
     content: tuple[str, int] | None  # (sha256, size) for files
+    layer: int = -1  # index of the layer that last set this node
 
 
 class VFS:
+    """Applies layer tars with OCI whiteout semantics, in memory.
+
+    Whiteouts and opaque markers hide entries contributed by *lower* layers
+    only; real entries added by the same layer survive regardless of their
+    position relative to the marker inside that layer's tar stream.
+    """
+
     def __init__(self) -> None:
         self.nodes: dict[str, Node] = {"": Node("dir", 0o755, 0, 0, None)}
 
@@ -39,20 +47,22 @@ class VFS:
         parts = [c for c in name.split("/") if c not in ("", ".")]
         return "/".join(parts) if parts else None
 
-    def _ensure_parents(self, path: str) -> None:
+    def _ensure_parents(self, path: str, layer: int) -> None:
         comps = path.split("/") if path else []
         for i in range(1, len(comps) + 1):
             p = "/".join(comps[:i])
             if p not in self.nodes:
-                self.nodes[p] = Node("dir", 0o755, 0, 0, None)
+                self.nodes[p] = Node("dir", 0o755, 0, 0, None, layer=layer)
 
-    def _remove(self, path: str) -> None:
-        self.nodes.pop(path, None)
+    def _remove(self, path: str, layer: int | None = None) -> None:
+        """Remove ``path`` and below; with ``layer`` given, only nodes from
+        lower layers (node.layer < layer) are affected."""
         prefix = path + "/"
-        for key in [k for k in self.nodes if k.startswith(prefix)]:
-            del self.nodes[key]
+        for key in [k for k in self.nodes if k == path or k.startswith(prefix)]:
+            if layer is None or self.nodes[key].layer < layer:
+                del self.nodes[key]
 
-    def apply_layer(self, tar_path: Path) -> None:
+    def apply_layer(self, tar_path: Path, layer: int = -1) -> None:
         with tarfile.open(tar_path, "r:") as tf:
             for ti in tf:
                 name = self._norm(ti.name)
@@ -60,26 +70,30 @@ class VFS:
                     continue
                 parent, _, base = name.rpartition("/")
                 if base == ".wh..wh..opq":  # opaque: hide lower-layer children
-                    self._ensure_parents(parent)
+                    self._ensure_parents(parent, layer)
                     prefix = parent + "/" if parent else ""
-                    for key in [k for k in self.nodes
-                                if k != parent and (k.startswith(prefix) if prefix else k != "")]:
-                        del self.nodes[key]
+                    for child in [k for k in self.nodes
+                                  if k != parent
+                                  and (k.startswith(prefix) if prefix else k != "")
+                                  and self.nodes[k].layer < layer]:
+                        del self.nodes[child]
                     continue
-                if base.startswith(".wh."):  # plain whiteout
+                if base.startswith(".wh."):  # plain whiteout: lower layers only
                     target = f"{parent}/{base[4:]}" if parent else base[4:]
-                    self._remove(target)
+                    self._remove(target, layer=layer)
                     continue
-                self._ensure_parents(parent)
+                self._ensure_parents(parent, layer)
                 if ti.isdir():
-                    self.nodes[name] = Node("dir", ti.mode & 0o7777, ti.uid, ti.gid, None)
+                    self.nodes[name] = Node(
+                        "dir", ti.mode & 0o7777, ti.uid, ti.gid, None, layer=layer
+                    )
                 elif ti.isreg():
                     f = tf.extractfile(ti)
                     data = f.read() if f else b""
                     self._remove(name)
                     self.nodes[name] = Node(
                         "file", ti.mode & 0o7777, ti.uid, ti.gid,
-                        (hashlib.sha256(data).hexdigest(), len(data)),
+                        (hashlib.sha256(data).hexdigest(), len(data)), layer=layer,
                     )
                 else:
                     raise SystemExit(f"unsupported entry type in {tar_path}: {ti.name}")
@@ -101,8 +115,8 @@ def resolve_layers(layout: Path, tag: str) -> list[Path]:
 
 def expand(layout: Path, tag: str) -> VFS:
     vfs = VFS()
-    for layer in resolve_layers(layout, tag):
-        vfs.apply_layer(layer)
+    for idx, layer in enumerate(resolve_layers(layout, tag)):
+        vfs.apply_layer(layer, layer=idx)
     return vfs
 
 
@@ -123,7 +137,14 @@ def main() -> int:
 
     only_a = sorted(set(a.nodes) - set(b.nodes))
     only_b = sorted(set(b.nodes) - set(a.nodes))
-    diffs = [p for p in sorted(set(a.nodes) & set(b.nodes)) if a.nodes[p] != b.nodes[p]]
+
+    def observable(node: Node) -> tuple:
+        # the bookkeeping layer index differs simply because the squashed
+        # image has fewer layers; compare observable attributes only
+        return node.kind, node.mode, node.uid, node.gid, node.content
+
+    diffs = [p for p in sorted(set(a.nodes) & set(b.nodes))
+             if observable(a.nodes[p]) != observable(b.nodes[p])]
 
     if not only_a and not only_b and not diffs:
         print(f"== OK: {tag_a} and {tag_b} expand to identical trees "
@@ -134,7 +155,7 @@ def main() -> int:
     for p in only_b:
         print(f"DIFF only in {tag_b}:     {p}")
     for p in diffs:
-        print(f"DIFF differs:             {p}\n  {tag_a}: {a.nodes[p]}\n  {tag_b}: {b.nodes[p]}")
+        print(f"DIFF differs:             {p}\n  {tag_a}: {observable(a.nodes[p])}\n  {tag_b}: {observable(b.nodes[p])}")
     return 1
 
 

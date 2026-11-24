@@ -222,6 +222,76 @@ def test_merge_two_layer_image_no_base(client, layout, tmp_path):
     expand_stack([merged_tar]).assert_same_as(expand_stack([l1, l2]))
 
 
+def test_merge_directory_rebuild_scenarios_end_to_end(client, tmp_path, monkeypatch):
+    """The three reported directory-replacement cases, through the full API:
+
+    * lower layer whiteouts a base-populated dir, upper layer rebuilds it;
+    * lower layer replaces the dir by a file, upper layer rebuilds the dir;
+    * the upper layer whiteouts and rebuilds the dir in the same tar, with
+      the whiteout marker placed after the new entries.
+    """
+    root = tmp_path / "oci-layout"
+    tars = tmp_path / "tars"
+    tars.mkdir()
+    base = tars / "base.tar"
+    build_layer_tar(base, [
+        dir_entry("app"),
+        dir_entry("app/.config"),
+        file_entry("app/.config/base.ini", b"[base]\n"),
+        file_entry("app/.config/settings.ini", b"debug=true\n"),
+        dir_entry("app/replaced"),
+        file_entry("app/replaced/leaf.txt", b"leaf\n"),
+    ])
+    l1 = tars / "l1.tar"
+    build_layer_tar(l1, [
+        whiteout_entry("app/.config"),
+        file_entry("app/replaced", b"now a file\n"),
+    ])
+    l2 = tars / "l2.tar"
+    build_layer_tar(l2, [
+        # explicit rebuild after the lower whiteout
+        dir_entry("app/.config", mode=0o750, uid=1000, gid=1000),
+        file_entry("app/.config/runtime.ini", b"[run]\n", mode=0o640,
+                   uid=1000, gid=1000),
+        # same-layer delete + rebuild, whiteout deliberately listed last
+        dir_entry("app/replaced"),
+        file_entry("app/replaced/new.txt", b"new\n"),
+        whiteout_entry("app/replaced"),
+    ])
+    make_layout(root, "rebuild:1", [base, l1, l2], startup_config=STARTUP)
+    monkeypatch.setenv("OCI_LAYOUT_DIR", str(root))
+
+    resp = client.post(
+        "/merge",
+        json={"source_tag": "rebuild:1", "target_tag": "rebuild:1-squashed"},
+    )
+    assert resp.status_code == 200, resp.text
+    body = resp.json()
+    merged_tar = _layer_tar_path(root, body["merged_layer"]["digest"])
+
+    # old and new images expand to the same tree (paths, contents, modes, owners)
+    old_tree = expand_stack([base, l1, l2])
+    new_tree = expand_stack([base, merged_tar])
+    new_tree.assert_same_as(old_tree)
+
+    # base-layer children stay hidden; rebuilt entries survive
+    paths = set(new_tree.nodes)
+    assert "app/.config/base.ini" not in paths
+    assert "app/.config/settings.ini" not in paths
+    assert "app/replaced/leaf.txt" not in paths
+    assert {"app/.config", "app/.config/runtime.ini",
+            "app/replaced", "app/replaced/new.txt"} <= paths
+    assert new_tree.nodes["app/.config"].mode == 0o750
+    assert (new_tree.nodes["app/.config"].uid,
+            new_tree.nodes["app/.config"].gid) == (1000, 1000)
+
+    # the merged layer carries hiding whiteouts for both rebuilt dirs
+    with tarfile.open(merged_tar, "r:") as tf:
+        entry_names = {m.name for m in tf}
+    assert "app/.wh..config" in entry_names
+    assert "app/.wh.replaced" in entry_names
+
+
 def test_failed_merge_cleans_temp_files(client, layout):
     root, _ = layout
     blobs = root / "blobs" / "sha256"
